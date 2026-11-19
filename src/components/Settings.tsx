@@ -29,6 +29,7 @@ import {
   CodeBlock,
   CodeBlockCode,
   Tooltip,
+  Switch,
 } from '@patternfly/react-core';
 import {
   CogIcon,
@@ -55,6 +56,7 @@ interface RegistryEntry {
   hasAuth: boolean;
   status?: 'authenticated' | 'failed' | 'verifying' | 'not_verified';
   error?: string;
+  tlsVerify?: boolean;
 }
 
 interface SystemInfo {
@@ -248,18 +250,24 @@ const SettingsPage: React.FC = () => {
   const fetchRegistries = async () => {
     try {
       const response = await axios.get('/api/registries');
-      setRegistries(response.data.registries || []);
+      const fetched: RegistryEntry[] = (response.data.registries || []).map((r: RegistryEntry) => ({
+        ...r,
+        tlsVerify: r.tlsVerify ?? true,
+      }));
+      setRegistries(fetched);
     } catch (error) {
       console.error('Error fetching registries:', error);
     }
   };
 
   const verifyRegistry = async (registry: string) => {
+    const entry = registries.find(r => r.registry === registry);
+    const tlsVerify = entry?.tlsVerify ?? true;
     setRegistries(prev => prev.map(r =>
       r.registry === registry ? { ...r, status: 'verifying' as const } : r,
     ));
     try {
-      const response = await axios.post('/api/registries/verify', { registry });
+      const response = await axios.post('/api/registries/verify', { registry, tlsVerify });
       setRegistries(prev => prev.map(r =>
         r.registry === registry ? { ...r, status: response.data.status, error: response.data.error } : r,
       ));
@@ -497,6 +505,7 @@ const SettingsPage: React.FC = () => {
                       <Thead>
                         <Tr>
                           <Th>Registry</Th>
+                          <Th>TLS Verify</Th>
                           <Th>Status</Th>
                         </Tr>
                       </Thead>
@@ -504,6 +513,19 @@ const SettingsPage: React.FC = () => {
                         {registries.map((r) => (
                           <Tr key={r.registry}>
                             <Td>{r.registry}</Td>
+                            <Td>
+                              <Switch
+                                id={`tls-verify-${r.registry}`}
+                                isChecked={r.tlsVerify !== false}
+                                onChange={(_event, checked) => {
+                                  setRegistries(prev => prev.map(reg =>
+                                    reg.registry === r.registry
+                                      ? { ...reg, tlsVerify: checked, status: 'not_verified' as const }
+                                      : reg,
+                                  ));
+                                }}
+                              />
+                            </Td>
                             <Td>
                               {r.status === 'authenticated' && (
                                 <Label status="success">Authenticated</Label>
