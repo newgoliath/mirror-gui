@@ -1334,6 +1334,7 @@ app.get('/api/channels', async (req: Request, res: Response) => {
   try {
     const channels = [
       'stable-4.16', 'stable-4.17', 'stable-4.18', 'stable-4.19', 'stable-4.20', 'stable-4.21', 'stable-4.22',
+      'stable-5.0',
     ];
     res.json(channels);
   } catch {

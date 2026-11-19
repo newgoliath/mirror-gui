@@ -6,6 +6,7 @@ FROM registry.redhat.io/redhat/redhat-operator-index:v4.19 AS redhat-4-19
 FROM registry.redhat.io/redhat/redhat-operator-index:v4.20 AS redhat-4-20
 FROM registry.redhat.io/redhat/redhat-operator-index:v4.21 AS redhat-4-21
 FROM registry.redhat.io/redhat/redhat-operator-index:v4.22 AS redhat-4-22
+FROM registry.redhat.io/redhat/redhat-operator-index:v5.0 AS redhat-5-0
 
 FROM registry.redhat.io/redhat/certified-operator-index:v4.16 AS certified-4-16
 FROM registry.redhat.io/redhat/certified-operator-index:v4.17 AS certified-4-17
@@ -14,6 +15,7 @@ FROM registry.redhat.io/redhat/certified-operator-index:v4.19 AS certified-4-19
 FROM registry.redhat.io/redhat/certified-operator-index:v4.20 AS certified-4-20
 FROM registry.redhat.io/redhat/certified-operator-index:v4.21 AS certified-4-21
 FROM registry.redhat.io/redhat/certified-operator-index:v4.22 AS certified-4-22
+FROM registry.redhat.io/redhat/certified-operator-index:v5.0 AS certified-5-0
 
 FROM registry.redhat.io/redhat/community-operator-index:v4.16 AS community-4-16
 FROM registry.redhat.io/redhat/community-operator-index:v4.17 AS community-4-17
@@ -22,6 +24,7 @@ FROM registry.redhat.io/redhat/community-operator-index:v4.19 AS community-4-19
 FROM registry.redhat.io/redhat/community-operator-index:v4.20 AS community-4-20
 FROM registry.redhat.io/redhat/community-operator-index:v4.21 AS community-4-21
 FROM registry.redhat.io/redhat/community-operator-index:v4.22 AS community-4-22
+FROM registry.redhat.io/redhat/community-operator-index:v5.0 AS community-5-0
 
 # --- Extract and process catalog data from the index images ---
 FROM registry.access.redhat.com/ubi9/nodejs-22-minimal AS catalog-processor
@@ -42,6 +45,7 @@ COPY --from=redhat-4-19 /configs catalog-data-synced/redhat-operator-index/v4.19
 COPY --from=redhat-4-20 /configs catalog-data-synced/redhat-operator-index/v4.20/configs/
 COPY --from=redhat-4-21 /configs catalog-data-synced/redhat-operator-index/v4.21/configs/
 COPY --from=redhat-4-22 /configs catalog-data-synced/redhat-operator-index/v4.22/configs/
+COPY --from=redhat-5-0 /configs catalog-data-synced/redhat-operator-index/v5.0/configs/
 
 COPY --from=certified-4-16 /configs catalog-data-synced/certified-operator-index/v4.16/configs/
 COPY --from=certified-4-17 /configs catalog-data-synced/certified-operator-index/v4.17/configs/
@@ -50,6 +54,7 @@ COPY --from=certified-4-19 /configs catalog-data-synced/certified-operator-index
 COPY --from=certified-4-20 /configs catalog-data-synced/certified-operator-index/v4.20/configs/
 COPY --from=certified-4-21 /configs catalog-data-synced/certified-operator-index/v4.21/configs/
 COPY --from=certified-4-22 /configs catalog-data-synced/certified-operator-index/v4.22/configs/
+COPY --from=certified-5-0 /configs catalog-data-synced/certified-operator-index/v5.0/configs/
 
 COPY --from=community-4-16 /configs catalog-data-synced/community-operator-index/v4.16/configs/
 COPY --from=community-4-17 /configs catalog-data-synced/community-operator-index/v4.17/configs/
@@ -58,11 +63,12 @@ COPY --from=community-4-19 /configs catalog-data-synced/community-operator-index
 COPY --from=community-4-20 /configs catalog-data-synced/community-operator-index/v4.20/configs/
 COPY --from=community-4-21 /configs catalog-data-synced/community-operator-index/v4.21/configs/
 COPY --from=community-4-22 /configs catalog-data-synced/community-operator-index/v4.22/configs/
+COPY --from=community-5-0 /configs catalog-data-synced/community-operator-index/v5.0/configs/
 
 SHELL ["/bin/bash", "-c"]
 RUN set -euo pipefail && \
     CATALOG_DATA_DIR=./catalog-data-synced && \
-    OCP_VERSIONS="4.16 4.17 4.18 4.19 4.20 4.21 4.22" && \
+    OCP_VERSIONS="4.16 4.17 4.18 4.19 4.20 4.21 4.22 5.0" && \
     CATALOG_TYPES="redhat-operator-index certified-operator-index community-operator-index" && \
     TOTAL=0 && SUCCESS=0 && FAILED=0 && \
     for ocp_version in $OCP_VERSIONS; do \
