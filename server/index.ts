@@ -2,6 +2,8 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
+import https from 'node:https';
+import http from 'node:http';
 import { exec, spawn, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import YAML from 'yaml';
@@ -27,6 +29,58 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const execAsync = promisify(exec);
+
+interface SimpleResponse {
+  ok: boolean;
+  status: number;
+  headers: { get(name: string): string | null };
+  text(): Promise<string>;
+}
+
+function registryFetch(
+  url: string,
+  options: { headers?: Record<string, string>; timeoutMs?: number; rejectUnauthorized?: boolean },
+): Promise<SimpleResponse> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const isHttps = parsed.protocol === 'https:';
+    const mod = isHttps ? https : http;
+
+    const reqOpts: https.RequestOptions = {
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method: 'GET',
+      headers: options.headers,
+      timeout: options.timeoutMs ?? 10000,
+      ...(isHttps ? { rejectUnauthorized: options.rejectUnauthorized ?? true } : {}),
+    };
+
+    const req = mod.request(reqOpts, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8');
+        resolve({
+          ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300,
+          status: res.statusCode ?? 0,
+          headers: {
+            get(name: string) {
+              const val = res.headers[name.toLowerCase()];
+              if (Array.isArray(val)) return val[0] ?? null;
+              return val ?? null;
+            },
+          },
+          text: () => Promise.resolve(body),
+        });
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(new Error('Request timed out')); });
+    req.end();
+  });
+}
 
 interface OperationRecord {
   id: string;
@@ -251,6 +305,7 @@ const DEV_CACHE_DIR = path.join(APP_ROOT_DIR, '.local-run', 'vite');
 const MIRROR_BASE_DIR = path.resolve(process.env.OC_MIRROR_BASE_MIRROR_DIR || path.join(STORAGE_DIR, 'mirrors'));
 const DEFAULT_MIRROR_DIR = path.join(MIRROR_BASE_DIR, 'default');
 const CUSTOM_MIRROR_DIR = path.join(MIRROR_BASE_DIR, 'custom');
+const WORKSPACE_DIR = path.join(STORAGE_DIR, 'workspace');
 const EPHEMERAL_MIRROR_DIR = path.resolve(process.env.OC_MIRROR_EPHEMERAL_DIR || path.join(APP_ROOT_DIR, 'mirror'));
 const PULL_SECRET_SEARCH_PATHS = [
   '/run/secrets/pull-secret.json',
@@ -300,6 +355,7 @@ async function ensureDirectories(): Promise<void> {
     CACHE_DIR,
     MIRROR_BASE_DIR,
     DEFAULT_MIRROR_DIR,
+    WORKSPACE_DIR,
   ];
   for (const dir of dirs) {
     try {
@@ -1605,7 +1661,16 @@ app.get('/api/operations/history', async (req: Request, res: Response) => {
 
 app.post('/api/operations/start', async (req: Request, res: Response) => {
   try {
-    const { configFile, mirrorDestinationSubdir, optionalFlags } = req.body;
+    const {
+      configFile,
+      mirrorDestinationSubdir,
+      optionalFlags,
+      mirrorMode,
+      targetRegistry,
+      srcTlsVerify,
+      destTlsVerify,
+      customCredentials,
+    } = req.body;
     const operationId = uuidv4();
     const configPath = path.join(CONFIGS_DIR, configFile);
 
@@ -1621,106 +1686,147 @@ app.post('/api/operations/start', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Configuration file not found' });
     }
 
+    const isMirrorToMirror = mirrorMode === 'mirrorToMirror';
+    const srcTls = srcTlsVerify === true ? 'true' : 'false';
+    const destTls = destTlsVerify === true ? 'true' : 'false';
+
+    const resolvedAuthfile = pullSecretPath || AUTHFILE_WRITE_PATH;
+    let effectiveAuthfile = resolvedAuthfile;
+
+    if (isMirrorToMirror) {
+      if (!targetRegistry || typeof targetRegistry !== 'string') {
+        return res.status(400).json({ error: 'Target registry is required for mirror-to-mirror mode' });
+      }
+
+      if (customCredentials?.username && customCredentials?.password) {
+        const tmpAuthPath = path.join(STORAGE_DIR, `authfile-${operationId}.json`);
+        let existingAuth: Record<string, unknown> = {};
+        try {
+          const content = await fsp.readFile(resolvedAuthfile, 'utf8');
+          existingAuth = JSON.parse(content);
+        } catch { /* no existing pull secret */ }
+
+        const auths = (existingAuth.auths as Record<string, unknown>) || {};
+        const auth = Buffer.from(`${customCredentials.username}:${customCredentials.password}`).toString('base64');
+        auths[targetRegistry] = { auth };
+        existingAuth.auths = auths;
+
+        await fsp.writeFile(tmpAuthPath, JSON.stringify(existingAuth, null, 2), 'utf8');
+        effectiveAuthfile = tmpAuthPath;
+      }
+
+      await fsp.mkdir(WORKSPACE_DIR, { recursive: true });
+    }
+
     const cacheDir = CACHE_DIR;
-    const baseMirrorPath = MIRROR_BASE_DIR;
-    let subdirName = 'default';
+    let mirrorPath = '';
+    let mirrorDestination: string;
 
-    if (mirrorDestinationSubdir && mirrorDestinationSubdir.trim()) {
-      const subdirInput = mirrorDestinationSubdir.trim();
+    if (isMirrorToMirror) {
+      mirrorDestination = `docker://${targetRegistry}`;
+    } else {
+      const baseMirrorPath = MIRROR_BASE_DIR;
+      let subdirName = 'default';
 
-      if (subdirInput.includes('/') || subdirInput.includes('..') || subdirInput.includes('\\')) {
-        return res.status(400).json({
-          error: 'Subdirectory name cannot contain path separators or traversal characters',
-          provided: subdirInput,
-          help: 'Use a simple name like "odf" or "production" (no slashes or special characters)',
-        });
+      if (mirrorDestinationSubdir && mirrorDestinationSubdir.trim()) {
+        const subdirInput = mirrorDestinationSubdir.trim();
+
+        if (subdirInput.includes('/') || subdirInput.includes('..') || subdirInput.includes('\\')) {
+          return res.status(400).json({
+            error: 'Subdirectory name cannot contain path separators or traversal characters',
+            provided: subdirInput,
+            help: 'Use a simple name like "odf" or "production" (no slashes or special characters)',
+          });
+        }
+
+        if (!subdirInput || subdirInput.length === 0) {
+          return res.status(400).json({ error: 'Subdirectory name cannot be empty' });
+        }
+
+        if (!/^[a-zA-Z0-9_-]+$/.test(subdirInput)) {
+          return res.status(400).json({
+            error: 'Subdirectory name contains invalid characters',
+            provided: subdirInput,
+            help: 'Use only letters, numbers, dashes (-), and underscores (_)',
+          });
+        }
+
+        subdirName = subdirInput;
       }
 
-      if (!subdirInput || subdirInput.length === 0) {
-        return res.status(400).json({ error: 'Subdirectory name cannot be empty' });
-      }
+      mirrorPath = path.join(baseMirrorPath, subdirName);
 
-      if (!/^[a-zA-Z0-9_-]+$/.test(subdirInput)) {
-        return res.status(400).json({
-          error: 'Subdirectory name contains invalid characters',
-          provided: subdirInput,
-          help: 'Use only letters, numbers, dashes (-), and underscores (_)',
-        });
-      }
-
-      subdirName = subdirInput;
-    }
-
-    const mirrorPath = path.join(baseMirrorPath, subdirName);
-
-    try {
-      await fsp.mkdir(baseMirrorPath, { recursive: true, mode: 0o777 });
-      const testFile = path.join(baseMirrorPath, '.test-write');
       try {
-        await fsp.writeFile(testFile, 'test', { flag: 'w' });
-        await fsp.unlink(testFile);
-      } catch (writeError: unknown) {
-        console.error(`Cannot write to base mirror directory ${baseMirrorPath}:`, writeError);
+        await fsp.mkdir(baseMirrorPath, { recursive: true, mode: 0o777 });
+        const testFile = path.join(baseMirrorPath, '.test-write');
+        try {
+          await fsp.writeFile(testFile, 'test', { flag: 'w' });
+          await fsp.unlink(testFile);
+        } catch (writeError: unknown) {
+          console.error(`Cannot write to base mirror directory ${baseMirrorPath}:`, writeError);
+          return res.status(500).json({
+            error: 'Base mirror directory is not writable',
+            path: baseMirrorPath,
+            details: (writeError as Error).message,
+            code: (writeError as NodeJS.ErrnoException).code,
+          });
+        }
+      } catch (error: unknown) {
+        console.error(`Error accessing base mirror directory ${baseMirrorPath}:`, error);
         return res.status(500).json({
-          error: 'Base mirror directory is not writable',
+          error: 'Cannot access base mirror directory',
           path: baseMirrorPath,
-          details: (writeError as Error).message,
-          code: (writeError as NodeJS.ErrnoException).code,
+          details: (error as Error).message,
+          code: (error as NodeJS.ErrnoException).code,
         });
       }
-    } catch (error: unknown) {
-      console.error(`Error accessing base mirror directory ${baseMirrorPath}:`, error);
-      return res.status(500).json({
-        error: 'Cannot access base mirror directory',
-        path: baseMirrorPath,
-        details: (error as Error).message,
-        code: (error as NodeJS.ErrnoException).code,
-      });
-    }
 
-    try {
-      const dirExists = await fsp.access(mirrorPath).then(() => true).catch(() => false);
-
-      if (!dirExists) {
-        await fsp.mkdir(mirrorPath, { recursive: true, mode: 0o775 });
-        console.log(`Created new mirror directory: ${mirrorPath}`);
-      } else {
-        console.log(`Using existing mirror directory: ${mirrorPath}`);
-      }
-
-      await fsp.access(mirrorPath, fs.constants.W_OK);
-
-      const testFile = path.join(mirrorPath, '.test-write');
       try {
-        await fsp.writeFile(testFile, 'test', { flag: 'w' });
-        await fsp.unlink(testFile);
-      } catch (writeError: unknown) {
-        console.error(`Cannot write to mirror directory ${mirrorPath}:`, writeError);
+        const dirExists = await fsp.access(mirrorPath).then(() => true).catch(() => false);
+
+        if (!dirExists) {
+          await fsp.mkdir(mirrorPath, { recursive: true, mode: 0o775 });
+          console.log(`Created new mirror directory: ${mirrorPath}`);
+        } else {
+          console.log(`Using existing mirror directory: ${mirrorPath}`);
+        }
+
+        await fsp.access(mirrorPath, fs.constants.W_OK);
+
+        const testFile = path.join(mirrorPath, '.test-write');
+        try {
+          await fsp.writeFile(testFile, 'test', { flag: 'w' });
+          await fsp.unlink(testFile);
+        } catch (writeError: unknown) {
+          console.error(`Cannot write to mirror directory ${mirrorPath}:`, writeError);
+          return res.status(500).json({
+            error: 'Mirror destination directory exists but is not writable',
+            path: mirrorPath,
+            subdirectory: subdirName,
+            details: (writeError as Error).message,
+            code: (writeError as NodeJS.ErrnoException).code,
+            help: 'The directory exists but the container cannot write to it. Check permissions on the host.',
+          });
+        }
+      } catch (error: unknown) {
+        console.error(`Error creating/accessing mirror directory ${mirrorPath}:`, error);
         return res.status(500).json({
-          error: 'Mirror destination directory exists but is not writable',
+          error: 'Cannot create or access mirror destination directory',
           path: mirrorPath,
           subdirectory: subdirName,
-          details: (writeError as Error).message,
-          code: (writeError as NodeJS.ErrnoException).code,
-          help: 'The directory exists but the container cannot write to it. Check permissions on the host.',
+          details: (error as Error).message,
+          code: (error as NodeJS.ErrnoException).code,
         });
       }
-    } catch (error: unknown) {
-      console.error(`Error creating/accessing mirror directory ${mirrorPath}:`, error);
-      return res.status(500).json({
-        error: 'Cannot create or access mirror destination directory',
-        path: mirrorPath,
-        subdirectory: subdirName,
-        details: (error as Error).message,
-        code: (error as NodeJS.ErrnoException).code,
-      });
+
+      mirrorDestination = pathToFileURL(mirrorPath).href;
     }
 
     const operation: OperationRecord = {
       id: operationId,
       name: `Mirror Operation ${operationId.slice(0, 8)}`,
       configFile,
-      mirrorDestination: mirrorPath,
+      mirrorDestination: isMirrorToMirror ? `docker://${targetRegistry}` : mirrorPath,
       status: 'running',
       startedAt: new Date().toISOString(),
       logs: [],
@@ -1746,18 +1852,19 @@ app.post('/api/operations/start', async (req: Request, res: Response) => {
       if (!logStream.destroyed) logStream.end();
     };
 
-    const mirrorUrl = pathToFileURL(mirrorPath).href;
-
-  const child = spawn('oc-mirror', [
+    const ocMirrorArgs = [
       '--v2',
       '--config', configPath,
-      '--dest-tls-verify=false',
-      '--src-tls-verify=false',
+      `--dest-tls-verify=${destTls}`,
+      `--src-tls-verify=${srcTls}`,
       '--cache-dir', cacheDir,
-      '--authfile', pullSecretPath || AUTHFILE_WRITE_PATH,
+      '--authfile', effectiveAuthfile,
+      ...(isMirrorToMirror ? ['--workspace', `file://${WORKSPACE_DIR}`] : []),
       ...additionalArgs,
-      mirrorUrl,
-    ], {
+      mirrorDestination,
+    ];
+
+    const child = spawn('oc-mirror', ocMirrorArgs, {
       stdio: ['ignore', 'pipe', 'pipe'],
       cwd: APP_ROOT_DIR,
     });
@@ -1831,6 +1938,10 @@ app.post('/api/operations/start', async (req: Request, res: Response) => {
         errorMessage,
         logs: logs.split('\n'),
       });
+
+      if (effectiveAuthfile !== resolvedAuthfile) {
+        await fsp.rm(effectiveAuthfile, { force: true }).catch(() => {});
+      }
     });
 
     child.on('error', async (error: Error) => {
@@ -1838,6 +1949,10 @@ app.post('/api/operations/start', async (req: Request, res: Response) => {
       operationFinalized = true;
       runningProcesses.delete(operationId);
       finalizeLogStream();
+
+      if (effectiveAuthfile !== resolvedAuthfile) {
+        await fsp.rm(effectiveAuthfile, { force: true }).catch(() => {});
+      }
 
       const completedAt = new Date().toISOString();
       const duration = Math.floor((new Date(completedAt).getTime() - new Date(operation.startedAt).getTime()) / 1000);
@@ -2132,7 +2247,7 @@ app.get('/api/registries', async (_req: Request, res: Response) => {
 
 app.post('/api/registries/verify', async (req: Request, res: Response) => {
   try {
-    const { registry } = req.body;
+    const { registry, tlsVerify } = req.body;
     if (!registry) {
       res.status(400).json({ error: 'Registry is required' });
       return;
@@ -2150,10 +2265,11 @@ app.post('/api/registries/verify', async (req: Request, res: Response) => {
       return;
     }
 
+    const rejectUnauthorized = tlsVerify !== false;
     const url = `https://${registry}/v2/`;
-    const response = await fetch(url, {
+    const response = await registryFetch(url, {
       headers: { 'Authorization': `Basic ${authData.auth}` },
-      signal: AbortSignal.timeout(10000),
+      rejectUnauthorized,
     });
 
     const sendResult = (result: { registry: string; status: string; error?: string }) => {
@@ -2174,9 +2290,9 @@ app.post('/api/registries/verify', async (req: Request, res: Response) => {
       if (realmMatch) {
         const tokenUrl = new URL(realmMatch[1]);
         if (serviceMatch) tokenUrl.searchParams.set('service', serviceMatch[1]);
-        const tokenRes = await fetch(tokenUrl.toString(), {
+        const tokenRes = await registryFetch(tokenUrl.toString(), {
           headers: { 'Authorization': `Basic ${authData.auth}` },
-          signal: AbortSignal.timeout(10000),
+          rejectUnauthorized,
         });
         if (tokenRes.ok) {
           sendResult({ registry, status: 'authenticated' });
@@ -2195,6 +2311,61 @@ app.post('/api/registries/verify', async (req: Request, res: Response) => {
     const errMsg = (error as Error).message || 'Connection failed';
     if (reg) registryVerificationCache[reg] = { status: 'failed', error: errMsg };
     res.json({ registry: reg, status: 'failed', error: errMsg });
+  }
+});
+
+app.post('/api/registries/verify-custom', async (req: Request, res: Response) => {
+  try {
+    const { registry, username, password, tlsVerify } = req.body;
+    if (!registry || typeof registry !== 'string') {
+      res.status(400).json({ error: 'Registry URL is required' });
+      return;
+    }
+    if (!username || !password) {
+      res.status(400).json({ error: 'Username and password are required' });
+      return;
+    }
+
+    const auth = Buffer.from(`${username}:${password}`).toString('base64');
+    const rejectUnauthorized = tlsVerify !== false;
+    const url = `https://${registry}/v2/`;
+
+    const response = await registryFetch(url, {
+      headers: { 'Authorization': `Basic ${auth}` },
+      rejectUnauthorized,
+    });
+
+    if (response.ok || response.status === 200) {
+      res.json({ registry, status: 'authenticated' });
+      return;
+    }
+
+    if (response.status === 401) {
+      const wwwAuth = response.headers.get('www-authenticate') || '';
+      const realmMatch = wwwAuth.match(/realm="([^"]+)"/);
+      const serviceMatch = wwwAuth.match(/service="([^"]+)"/);
+
+      if (realmMatch) {
+        const tokenUrl = new URL(realmMatch[1]);
+        if (serviceMatch) tokenUrl.searchParams.set('service', serviceMatch[1]);
+        const tokenRes = await registryFetch(tokenUrl.toString(), {
+          headers: { 'Authorization': `Basic ${auth}` },
+          rejectUnauthorized,
+        });
+        if (tokenRes.ok) {
+          res.json({ registry, status: 'authenticated' });
+          return;
+        }
+        const body = await tokenRes.text().catch(() => '');
+        res.json({ registry, status: 'failed', error: `Authentication failed (${tokenRes.status}): ${body.slice(0, 200)}` });
+        return;
+      }
+    }
+
+    res.json({ registry, status: 'failed', error: `HTTP ${response.status}` });
+  } catch (error: unknown) {
+    console.error(`Error verifying custom registry ${req.body?.registry}:`, error);
+    res.json({ registry: req.body?.registry, status: 'failed', error: (error as Error).message || 'Connection failed' });
   }
 });
 

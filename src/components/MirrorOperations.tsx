@@ -44,6 +44,9 @@ import {
   ExpandableSectionToggle,
   Switch,
   NumberInput,
+  Radio,
+  HelperText,
+  HelperTextItem,
 } from '@patternfly/react-core';
 import {
   SyncAltIcon,
@@ -80,6 +83,18 @@ interface Operation {
   duration?: number;
   mirrorDestination?: string;
   errorMessage?: string;
+}
+
+type MirrorMode = 'mirrorToDisk' | 'mirrorToMirror';
+
+type RegistrySource = 'pullSecret' | 'custom';
+
+interface RegistryInfo {
+  registry: string;
+  username: string;
+  hasAuth: boolean;
+  status: string;
+  error?: string;
 }
 
 interface OptionalFlags {
@@ -333,6 +348,20 @@ const MirrorOperations: React.FC = () => {
   const [advancedOptionsExpanded, setAdvancedOptionsExpanded] = useState(false);
   const [optionalFlags, setOptionalFlags] = useState<OptionalFlags>(DEFAULT_OPTIONAL_FLAGS);
 
+  const [mirrorMode, setMirrorMode] = useState<MirrorMode>('mirrorToDisk');
+  const [registrySource, setRegistrySource] = useState<RegistrySource>('pullSecret');
+  const [pullSecretRegistries, setPullSecretRegistries] = useState<RegistryInfo[]>([]);
+  const [selectedRegistry, setSelectedRegistry] = useState('');
+  const [registrySelectOpen, setRegistrySelectOpen] = useState(false);
+  const [customRegistryUrl, setCustomRegistryUrl] = useState('');
+  const [customRegistryUsername, setCustomRegistryUsername] = useState('');
+  const [customRegistryPassword, setCustomRegistryPassword] = useState('');
+  const [validatingRegistry, setValidatingRegistry] = useState(false);
+  const [registryValidationStatus, setRegistryValidationStatus] = useState<'none' | 'success' | 'failed'>('none');
+  const [registryValidationError, setRegistryValidationError] = useState('');
+  const [srcTlsVerify, setSrcTlsVerify] = useState(false);
+  const [destTlsVerify, setDestTlsVerify] = useState(false);
+
   const operationsRef = useRef<Operation[]>([]);
   const notifiedOperationsRef = useRef(new Set<string>());
   const logStreamOperationIdRef = useRef<string | null>(null);
@@ -428,6 +457,73 @@ const MirrorOperations: React.FC = () => {
     }
   }, []);
 
+  const fetchRegistries = useCallback(async () => {
+    try {
+      const response = await axios.get<{ registries: RegistryInfo[] }>('/api/registries');
+      setPullSecretRegistries(response.data.registries ?? []);
+    } catch (error) {
+      console.error('Error fetching registries:', error);
+      setPullSecretRegistries([]);
+    }
+  }, []);
+
+  const validateTargetRegistry = useCallback(async () => {
+    setValidatingRegistry(true);
+    setRegistryValidationStatus('none');
+    setRegistryValidationError('');
+
+    try {
+      if (registrySource === 'pullSecret') {
+        if (!selectedRegistry) {
+          addDangerAlert('Please select a registry');
+          setValidatingRegistry(false);
+          return;
+        }
+        const response = await axios.post('/api/registries/verify', { registry: selectedRegistry, tlsVerify: destTlsVerify });
+        if (response.data.status === 'authenticated') {
+          setRegistryValidationStatus('success');
+          addSuccessAlert(`Registry "${selectedRegistry}" validated successfully`);
+        } else {
+          setRegistryValidationStatus('failed');
+          setRegistryValidationError(response.data.error || 'Verification failed');
+          addDangerAlert(`Registry validation failed: ${response.data.error || 'Unknown error'}`);
+        }
+      } else {
+        if (!customRegistryUrl.trim()) {
+          addDangerAlert('Please enter a registry URL');
+          setValidatingRegistry(false);
+          return;
+        }
+        if (!customRegistryUsername.trim() || !customRegistryPassword) {
+          addDangerAlert('Please enter credentials');
+          setValidatingRegistry(false);
+          return;
+        }
+        const response = await axios.post('/api/registries/verify-custom', {
+          registry: customRegistryUrl.trim(),
+          username: customRegistryUsername.trim(),
+          password: customRegistryPassword,
+          tlsVerify: destTlsVerify,
+        });
+        if (response.data.status === 'authenticated') {
+          setRegistryValidationStatus('success');
+          addSuccessAlert(`Registry "${customRegistryUrl.trim()}" validated successfully`);
+        } else {
+          setRegistryValidationStatus('failed');
+          setRegistryValidationError(response.data.error || 'Verification failed');
+          addDangerAlert(`Registry validation failed: ${response.data.error || 'Unknown error'}`);
+        }
+      }
+    } catch (error: unknown) {
+      const err = error as { response?: { data?: { error?: string } }; message?: string };
+      setRegistryValidationStatus('failed');
+      setRegistryValidationError(err.response?.data?.error || err.message || 'Connection failed');
+      addDangerAlert(`Registry validation failed: ${err.response?.data?.error || err.message}`);
+    } finally {
+      setValidatingRegistry(false);
+    }
+  }, [registrySource, selectedRegistry, customRegistryUrl, customRegistryUsername, customRegistryPassword, destTlsVerify, addSuccessAlert, addDangerAlert]);
+
   const fetchFolders = useCallback(async () => {
     try {
       const response = await axios.get<{ folders: string[] }>('/api/mirror-folders');
@@ -501,10 +597,11 @@ const MirrorOperations: React.FC = () => {
     fetchOperations();
     fetchConfigurations();
     void fetchFolders();
+    void fetchRegistries();
     axios.get('/api/system/info').then(res => setHostDataDir(res.data.hostDataDir || '')).catch(() => {});
     const interval = setInterval(fetchOperations, 5000);
     return () => clearInterval(interval);
-  }, [fetchOperations, fetchConfigurations, fetchFolders]);
+  }, [fetchOperations, fetchConfigurations, fetchFolders, fetchRegistries]);
 
   useEffect(() => {
     operationsRef.current = operations;
@@ -551,6 +648,21 @@ const MirrorOperations: React.FC = () => {
       return;
     }
 
+    if (mirrorMode === 'mirrorToMirror') {
+      if (registrySource === 'pullSecret' && !selectedRegistry) {
+        addDangerAlert('Please select a target registry');
+        return;
+      }
+      if (registrySource === 'custom' && !customRegistryUrl.trim()) {
+        addDangerAlert('Please enter a target registry URL');
+        return;
+      }
+      if (registrySource === 'custom' && (!customRegistryUsername.trim() || !customRegistryPassword)) {
+        addDangerAlert('Please enter credentials for the target registry');
+        return;
+      }
+    }
+
     const flagsValidationError = getOptionalFlagsValidationError(optionalFlags);
     if (flagsValidationError) {
       addDangerAlert(flagsValidationError);
@@ -563,11 +675,24 @@ const MirrorOperations: React.FC = () => {
       return;
     }
 
+    const targetRegistry = mirrorMode === 'mirrorToMirror'
+      ? (registrySource === 'pullSecret' ? selectedRegistry : customRegistryUrl.trim())
+      : undefined;
+
+    const customCredentials = mirrorMode === 'mirrorToMirror' && registrySource === 'custom'
+      ? { username: customRegistryUsername.trim(), password: customRegistryPassword }
+      : undefined;
+
     try {
       setLoading(true);
       const response = await axios.post('/api/operations/start', {
         configFile: selectedConfig,
-        mirrorDestinationSubdir: mirrorDestinationSubdir.trim() || undefined,
+        mirrorMode,
+        ...(mirrorMode === 'mirrorToDisk'
+          ? { mirrorDestinationSubdir: mirrorDestinationSubdir.trim() || undefined }
+          : { targetRegistry, customCredentials }),
+        srcTlsVerify,
+        destTlsVerify,
         ...(Object.keys(optionalFlagsPayload).length > 0
           ? { optionalFlags: optionalFlagsPayload }
           : {}),
@@ -870,99 +995,311 @@ const MirrorOperations: React.FC = () => {
             </InputGroup>
           </FormGroup>
 
-          <Flex alignItems={{ default: 'alignItemsFlexEnd' }} className="pf-v6-u-mt-md">
-            <FlexItem>
+          <FormGroup
+            label={
+              <FormGroupInfoLabel
+                text="Mirror Mode"
+                ariaLabel="More info about mirror mode"
+                bodyContent={
+                  <div>
+                    <strong>Mirror to Disk</strong>: Saves images to a local archive on disk (file://). Use for air-gapped environments where you need to transport media.
+                    <br /><br />
+                    <strong>Mirror to Mirror</strong>: Copies images directly from source registries to a target registry (docker://). Use when both source and target registries are accessible.
+                  </div>
+                }
+              />
+            }
+            fieldId="mirror-mode"
+            className="pf-v6-u-mt-md"
+          >
+            <Flex spaceItems={{ default: 'spaceItemsLg' }}>
+              <FlexItem>
+                <Radio
+                  id="mode-mirror-to-disk"
+                  name="mirror-mode"
+                  label="Mirror to Disk"
+                  isChecked={mirrorMode === 'mirrorToDisk'}
+                  onChange={() => {
+                    setMirrorMode('mirrorToDisk');
+                    setRegistryValidationStatus('none');
+                    setRegistryValidationError('');
+                  }}
+                />
+              </FlexItem>
+              <FlexItem>
+                <Radio
+                  id="mode-mirror-to-mirror"
+                  name="mirror-mode"
+                  label="Mirror to Mirror"
+                  isChecked={mirrorMode === 'mirrorToMirror'}
+                  onChange={() => {
+                    setMirrorMode('mirrorToMirror');
+                    setRegistryValidationStatus('none');
+                    setRegistryValidationError('');
+                  }}
+                />
+              </FlexItem>
+            </Flex>
+          </FormGroup>
+
+          {mirrorMode === 'mirrorToDisk' ? (
+            <Flex alignItems={{ default: 'alignItemsFlexEnd' }} className="pf-v6-u-mt-md">
+              <FlexItem>
+                <FormGroup
+                  label={
+                    <FormGroupInfoLabel
+                      text="Mirror Destination Folder"
+                      ariaLabel="More info about mirror destination folder"
+                      bodyContent="Mirror output is saved to data/mirrors/<folder>. Defaults to &quot;default&quot; if unchanged. Select an existing folder or create a new one from the dropdown."
+                    />
+                  }
+                  fieldId="mirror-subdir"
+                >
+                  <Select
+                    id="mirror-subdir"
+                    isOpen={folderSelectOpen}
+                    selected={mirrorDestinationSubdir || undefined}
+                    onSelect={(_e, val) => {
+                      if (val === '__create__') return;
+                      setMirrorDestinationSubdir(val as string);
+                      setFolderSelectOpen(false);
+                    }}
+                    onOpenChange={(open) => {
+                      setFolderSelectOpen(open);
+                      if (!open) {
+                        setFolderCreateMode(false);
+                        setNewFolderName('');
+                      }
+                    }}
+                    toggle={(toggleRef) => (
+                      <MenuToggle
+                        ref={toggleRef}
+                        onClick={() => setFolderSelectOpen((prev) => !prev)}
+                        isExpanded={folderSelectOpen}
+                        style={{ width: '250px' }}
+                      >
+                        {mirrorDestinationSubdir || 'default'}
+                      </MenuToggle>
+                    )}
+                  >
+                    {folderCreateMode ? (
+                      <div style={{ padding: 'var(--pf-t--global--spacer--sm)', display: 'flex', gap: 'var(--pf-t--global--spacer--xs)' }}>
+                        <TextInput
+                          aria-label="New folder name"
+                          placeholder="Enter folder name"
+                          value={newFolderName}
+                          onChange={(_e, v) => setNewFolderName(v)}
+                          autoFocus
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && newFolderName.trim()) {
+                              void confirmCreateFolder(newFolderName);
+                            }
+                            if (e.key === 'Escape') {
+                              setFolderCreateMode(false);
+                              setNewFolderName('');
+                            }
+                          }}
+                        />
+                        <Button
+                          variant="plain"
+                          icon={<CheckIcon />}
+                          isDisabled={!newFolderName.trim()}
+                          onClick={() => void confirmCreateFolder(newFolderName)}
+                        />
+                        <Button
+                          variant="plain"
+                          icon={<TimesIcon />}
+                          onClick={() => {
+                            setFolderCreateMode(false);
+                            setNewFolderName('');
+                          }}
+                        />
+                      </div>
+                    ) : (
+                      <SelectList>
+                        {availableFolders.map((folder) => (
+                          <SelectOption key={folder} value={folder}>{folder}</SelectOption>
+                        ))}
+                        {availableFolders.length > 0 && <Divider />}
+                        <SelectOption
+                          value="__create__"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setFolderCreateMode(true);
+                            setNewFolderName('');
+                          }}
+                        >
+                          <PlusCircleIcon className="pf-v6-u-mr-xs" /> Create new folder...
+                        </SelectOption>
+                      </SelectList>
+                    )}
+                  </Select>
+                </FormGroup>
+              </FlexItem>
+            </Flex>
+          ) : (
+            <div className="pf-v6-u-mt-md">
               <FormGroup
                 label={
                   <FormGroupInfoLabel
-                    text="Mirror Destination Folder"
-                    ariaLabel="More info about mirror destination folder"
-                    bodyContent="Mirror output is saved to data/mirrors/<folder>. Defaults to &quot;default&quot; if unchanged. Select an existing folder or create a new one from the dropdown."
+                    text="Target Registry"
+                    ariaLabel="More info about target registry"
+                    bodyContent="Choose a registry from your pull secret or enter a custom registry URL with credentials. The target registry must be accessible from this machine."
                   />
                 }
-                fieldId="mirror-subdir"
+                fieldId="target-registry"
               >
-                <Select
-                  id="mirror-subdir"
-                  isOpen={folderSelectOpen}
-                  selected={mirrorDestinationSubdir || undefined}
-                  onSelect={(_e, val) => {
-                    if (val === '__create__') return;
-                    setMirrorDestinationSubdir(val as string);
-                    setFolderSelectOpen(false);
-                  }}
-                  onOpenChange={(open) => {
-                    setFolderSelectOpen(open);
-                    if (!open) {
-                      setFolderCreateMode(false);
-                      setNewFolderName('');
-                    }
-                  }}
-                  toggle={(toggleRef) => (
-                    <MenuToggle
-                      ref={toggleRef}
-                      onClick={() => setFolderSelectOpen((prev) => !prev)}
-                      isExpanded={folderSelectOpen}
-                      style={{ width: '250px' }}
-                    >
-                      {mirrorDestinationSubdir || 'default'}
-                    </MenuToggle>
-                  )}
-                >
-                  {folderCreateMode ? (
-                    <div style={{ padding: 'var(--pf-t--global--spacer--sm)', display: 'flex', gap: 'var(--pf-t--global--spacer--xs)' }}>
-                      <TextInput
-                        aria-label="New folder name"
-                        placeholder="Enter folder name"
-                        value={newFolderName}
-                        onChange={(_e, v) => setNewFolderName(v)}
-                        autoFocus
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter' && newFolderName.trim()) {
-                            void confirmCreateFolder(newFolderName);
-                          }
-                          if (e.key === 'Escape') {
-                            setFolderCreateMode(false);
-                            setNewFolderName('');
-                          }
+                <Flex spaceItems={{ default: 'spaceItemsLg' }} className="pf-v6-u-mb-sm">
+                  <FlexItem>
+                    <Radio
+                      id="registry-from-pull-secret"
+                      name="registry-source"
+                      label="From Pull Secret"
+                      isChecked={registrySource === 'pullSecret'}
+                      onChange={() => {
+                        setRegistrySource('pullSecret');
+                        setRegistryValidationStatus('none');
+                        setRegistryValidationError('');
+                      }}
+                    />
+                  </FlexItem>
+                  <FlexItem>
+                    <Radio
+                      id="registry-custom"
+                      name="registry-source"
+                      label="Custom Registry"
+                      isChecked={registrySource === 'custom'}
+                      onChange={() => {
+                        setRegistrySource('custom');
+                        setRegistryValidationStatus('none');
+                        setRegistryValidationError('');
+                      }}
+                    />
+                  </FlexItem>
+                </Flex>
+
+                {registrySource === 'pullSecret' ? (
+                  <Flex alignItems={{ default: 'alignItemsFlexEnd' }} spaceItems={{ default: 'spaceItemsSm' }}>
+                    <FlexItem grow={{ default: 'grow' }}>
+                      <Select
+                        id="target-registry-select"
+                        isOpen={registrySelectOpen}
+                        selected={selectedRegistry}
+                        onSelect={(_e, val) => {
+                          setSelectedRegistry(val as string);
+                          setRegistrySelectOpen(false);
+                          setRegistryValidationStatus('none');
+                          setRegistryValidationError('');
                         }}
-                      />
-                      <Button
-                        variant="plain"
-                        icon={<CheckIcon />}
-                        isDisabled={!newFolderName.trim()}
-                        onClick={() => void confirmCreateFolder(newFolderName)}
-                      />
-                      <Button
-                        variant="plain"
-                        icon={<TimesIcon />}
-                        onClick={() => {
-                          setFolderCreateMode(false);
-                          setNewFolderName('');
-                        }}
-                      />
-                    </div>
-                  ) : (
-                    <SelectList>
-                      {availableFolders.map((folder) => (
-                        <SelectOption key={folder} value={folder}>{folder}</SelectOption>
-                      ))}
-                      {availableFolders.length > 0 && <Divider />}
-                      <SelectOption
-                        value="__create__"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setFolderCreateMode(true);
-                          setNewFolderName('');
-                        }}
+                        onOpenChange={(open) => setRegistrySelectOpen(open)}
+                        toggle={(toggleRef) => (
+                          <MenuToggle
+                            ref={toggleRef}
+                            onClick={() => setRegistrySelectOpen(prev => !prev)}
+                            isExpanded={registrySelectOpen}
+                            style={{ width: '100%' }}
+                          >
+                            {selectedRegistry || 'Select a target registry...'}
+                          </MenuToggle>
+                        )}
                       >
-                        <PlusCircleIcon className="pf-v6-u-mr-xs" /> Create new folder...
-                      </SelectOption>
-                    </SelectList>
-                  )}
-                </Select>
+                        <SelectList>
+                          {pullSecretRegistries.map(r => (
+                            <SelectOption key={r.registry} value={r.registry}>
+                              {r.registry} {r.username ? `(${r.username})` : ''}
+                            </SelectOption>
+                          ))}
+                          {pullSecretRegistries.length === 0 && (
+                            <SelectOption isDisabled value="none">
+                              No registries found in pull secret
+                            </SelectOption>
+                          )}
+                        </SelectList>
+                      </Select>
+                    </FlexItem>
+                    <FlexItem>
+                      <Button
+                        variant="secondary"
+                        icon={validatingRegistry ? <Spinner size="md" /> : <CheckIcon />}
+                        onClick={validateTargetRegistry}
+                        isDisabled={!selectedRegistry || validatingRegistry}
+                      >
+                        Validate
+                      </Button>
+                    </FlexItem>
+                  </Flex>
+                ) : (
+                  <div>
+                    <Flex direction={{ default: 'column' }} spaceItems={{ default: 'spaceItemsSm' }}>
+                      <FlexItem>
+                        <TextInput
+                          id="custom-registry-url"
+                          aria-label="Custom registry URL"
+                          placeholder="e.g. registry.example.com:5000"
+                          value={customRegistryUrl}
+                          onChange={(_e, v) => {
+                            setCustomRegistryUrl(v);
+                            setRegistryValidationStatus('none');
+                            setRegistryValidationError('');
+                          }}
+                        />
+                      </FlexItem>
+                      <FlexItem>
+                        <Flex spaceItems={{ default: 'spaceItemsSm' }}>
+                          <FlexItem grow={{ default: 'grow' }}>
+                            <TextInput
+                              id="custom-registry-username"
+                              aria-label="Registry username"
+                              placeholder="Username"
+                              value={customRegistryUsername}
+                              onChange={(_e, v) => setCustomRegistryUsername(v)}
+                            />
+                          </FlexItem>
+                          <FlexItem grow={{ default: 'grow' }}>
+                            <TextInput
+                              id="custom-registry-password"
+                              aria-label="Registry password"
+                              placeholder="Password"
+                              type="password"
+                              value={customRegistryPassword}
+                              onChange={(_e, v) => setCustomRegistryPassword(v)}
+                            />
+                          </FlexItem>
+                          <FlexItem>
+                            <Button
+                              variant="secondary"
+                              icon={validatingRegistry ? <Spinner size="md" /> : <CheckIcon />}
+                              onClick={validateTargetRegistry}
+                              isDisabled={!customRegistryUrl.trim() || !customRegistryUsername.trim() || !customRegistryPassword || validatingRegistry}
+                            >
+                              Validate
+                            </Button>
+                          </FlexItem>
+                        </Flex>
+                      </FlexItem>
+                    </Flex>
+                  </div>
+                )}
+
+                {registryValidationStatus === 'success' && (
+                  <HelperText className="pf-v6-u-mt-sm">
+                    <HelperTextItem variant="success">
+                      Registry authenticated successfully
+                    </HelperTextItem>
+                  </HelperText>
+                )}
+                {registryValidationStatus === 'failed' && (
+                  <HelperText className="pf-v6-u-mt-sm">
+                    <HelperTextItem variant="error">
+                      {registryValidationError || 'Registry validation failed'}
+                    </HelperTextItem>
+                  </HelperText>
+                )}
               </FormGroup>
-            </FlexItem>
+            </div>
+          )}
+
+          <Flex alignItems={{ default: 'alignItemsFlexEnd' }} className="pf-v6-u-mt-md">
             <FlexItem>
               <ExpandableSectionToggle
                 isExpanded={advancedOptionsExpanded}
@@ -994,6 +1331,46 @@ const MirrorOperations: React.FC = () => {
             toggleId="advanced-options-toggle"
             contentId="advanced-options-content"
           >
+            <FormGroup
+              label={
+                <FormGroupInfoLabel
+                  text="Verify source TLS"
+                  ariaLabel="More info about source TLS verification"
+                  bodyContent="Require HTTPS and verify certificates when pulling from source registries. Disable for registries using self-signed certificates."
+                />
+              }
+              fieldId="flag-src-tls-verify"
+              className="pf-v6-u-mb-md"
+            >
+              <Switch
+                id="flag-src-tls-verify"
+                isChecked={srcTlsVerify}
+                onChange={(_e, checked) => setSrcTlsVerify(checked)}
+                aria-label="Enable source TLS verification"
+              />
+            </FormGroup>
+
+            <FormGroup
+              label={
+                <FormGroupInfoLabel
+                  text="Verify destination TLS"
+                  ariaLabel="More info about destination TLS verification"
+                  bodyContent="Require HTTPS and verify certificates when pushing to the destination registry. Disable for registries using self-signed certificates."
+                />
+              }
+              fieldId="flag-dest-tls-verify"
+              className="pf-v6-u-mb-md"
+            >
+              <Switch
+                id="flag-dest-tls-verify"
+                isChecked={destTlsVerify}
+                onChange={(_e, checked) => setDestTlsVerify(checked)}
+                aria-label="Enable destination TLS verification"
+              />
+            </FormGroup>
+
+            <Divider className="pf-v6-u-mb-md" />
+
             <FormGroup
               label={
                 <FormGroupInfoLabel
