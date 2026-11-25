@@ -30,9 +30,11 @@ import {
   CodeBlockCode,
   Tooltip,
   Switch,
+  Checkbox,
 } from '@patternfly/react-core';
 import {
   CogIcon,
+  CubesIcon,
   DatabaseIcon,
   KeyIcon,
   RegistryIcon,
@@ -142,6 +144,44 @@ const SettingsPage: React.FC = () => {
 
   const [catalogDigests, setCatalogDigests] = useState<{ name: string; url: string; digest: string | null; syncedAt: string | null }[]>([]);
   const [digestsExpanded, setDigestsExpanded] = useState(false);
+
+  interface CatalogAvailableEntry {
+    catalogType: string;
+    ocpVersion: string;
+    operatorCount: number;
+    source: 'built-in' | 'runtime';
+    syncedAt: string | null;
+  }
+  const [catalogAvailable, setCatalogAvailable] = useState<CatalogAvailableEntry[]>([]);
+  const [catalogAvailableVersions, setCatalogAvailableVersions] = useState<string[]>([]);
+  const [catalogEnabledVersions, setCatalogEnabledVersions] = useState<string[]>([]);
+  const [catalogConfigDirty, setCatalogConfigDirty] = useState(false);
+
+  const fetchCatalogConfig = useCallback(async () => {
+    try {
+      const response = await axios.get('/api/catalog-config');
+      setCatalogAvailable(response.data.catalogs);
+      setCatalogAvailableVersions(response.data.availableVersions);
+      setCatalogEnabledVersions(response.data.enabledVersions);
+      setCatalogConfigDirty(false);
+    } catch {
+      console.error('Error fetching catalog config');
+    }
+  }, []);
+
+  const saveCatalogConfig = async () => {
+    setLoading(true);
+    try {
+      await axios.put('/api/catalog-config', { enabledVersions: catalogEnabledVersions });
+      addSuccessAlert('Catalog configuration saved. Changes will take effect on next page load.');
+      setCatalogConfigDirty(false);
+    } catch (error: unknown) {
+      const msg = (error as { response?: { data?: { error?: string } } }).response?.data?.error || 'Failed to save catalog configuration';
+      addDangerAlert(msg);
+    } finally {
+      setLoading(false);
+    }
+  };
   /** Snapshot of digest by `catalogName:ocpVersion` taken when sync starts; used to label Updated vs Unchanged after sync. */
 
   const fetchCatalogDigests = useCallback(async () => {
@@ -326,6 +366,7 @@ const SettingsPage: React.FC = () => {
     fetchRegistries();
     fetchSyncStatus();
     fetchCatalogDigests();
+    fetchCatalogConfig();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -663,6 +704,107 @@ const SettingsPage: React.FC = () => {
                     Clean Up Cache
                   </Button>
                 </ActionGroup>
+              </div>
+            </Tab>
+
+            <Tab
+              eventKey="catalogs"
+              title={<TabTitleText><CubesIcon /> Catalogs</TabTitleText>}
+            >
+              <div className="pf-v6-u-py-lg">
+                <Title headingLevel="h3" className="pf-v6-u-mb-md">Operator Catalog Versions</Title>
+
+                <Alert
+                  variant="custom"
+                  isInline
+                  isPlain
+                  customIcon={<InfoCircleIcon style={{ color: 'var(--pf-t--global--icon--color--regular)' }} />}
+                  title="Select which OCP versions to enable"
+                  className="pf-v6-u-mb-lg"
+                >
+                  Enabled versions determine which operator catalogs are available in the Mirror Configuration builder.
+                  Disabling unused versions reduces load time and clutter.
+                </Alert>
+
+                {catalogAvailableVersions.length === 0 ? (
+                  <Alert variant="warning" isInline isPlain title="No catalog data found">
+                    No operator catalog data is available. Run a catalog sync or rebuild the container image with catalog data.
+                  </Alert>
+                ) : (
+                  <>
+                    <Table aria-label="Catalog versions" variant="compact">
+                      <Thead>
+                        <Tr>
+                          <Th>
+                            <Checkbox
+                              id="catalog-select-all"
+                              isChecked={catalogEnabledVersions.length === catalogAvailableVersions.length}
+                              onChange={(_event, checked) => {
+                                setCatalogEnabledVersions(checked ? [...catalogAvailableVersions] : []);
+                                setCatalogConfigDirty(true);
+                              }}
+                              aria-label="Select all versions"
+                            />
+                          </Th>
+                          <Th>OCP Version</Th>
+                          <Th>Red Hat Operators</Th>
+                          <Th>Certified Operators</Th>
+                          <Th>Community Operators</Th>
+                          <Th>Source</Th>
+                        </Tr>
+                      </Thead>
+                      <Tbody>
+                        {catalogAvailableVersions.map(version => {
+                          const catalogs = catalogAvailable.filter(c => c.ocpVersion === version);
+                          const redhat = catalogs.find(c => c.catalogType === 'redhat-operator-index');
+                          const certified = catalogs.find(c => c.catalogType === 'certified-operator-index');
+                          const community = catalogs.find(c => c.catalogType === 'community-operator-index');
+                          const source = catalogs[0]?.source ?? 'built-in';
+                          const isEnabled = catalogEnabledVersions.includes(version);
+
+                          return (
+                            <Tr key={version}>
+                              <Td>
+                                <Checkbox
+                                  id={`catalog-version-${version}`}
+                                  isChecked={isEnabled}
+                                  onChange={(_event, checked) => {
+                                    setCatalogEnabledVersions(prev =>
+                                      checked ? [...prev, version] : prev.filter(v => v !== version),
+                                    );
+                                    setCatalogConfigDirty(true);
+                                  }}
+                                  aria-label={`Enable ${version}`}
+                                />
+                              </Td>
+                              <Td><strong>{version.replace(/^v/, '')}</strong></Td>
+                              <Td>{redhat ? redhat.operatorCount : '—'}</Td>
+                              <Td>{certified ? certified.operatorCount : '—'}</Td>
+                              <Td>{community ? community.operatorCount : '—'}</Td>
+                              <Td>
+                                <Label status={source === 'runtime' ? 'success' : 'custom'}>
+                                  {source === 'runtime' ? 'Synced' : 'Built-in'}
+                                </Label>
+                              </Td>
+                            </Tr>
+                          );
+                        })}
+                      </Tbody>
+                    </Table>
+
+                    <ActionGroup className="pf-v6-u-mt-md">
+                      <Button
+                        variant="primary"
+                        icon={<SaveIcon />}
+                        onClick={saveCatalogConfig}
+                        isDisabled={loading || !catalogConfigDirty}
+                        isLoading={loading}
+                      >
+                        Save
+                      </Button>
+                    </ActionGroup>
+                  </>
+                )}
               </div>
             </Tab>
 

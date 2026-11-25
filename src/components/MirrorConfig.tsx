@@ -154,7 +154,7 @@ interface CleanConfig {
 
 type VersionField = 'minVersion' | 'maxVersion';
 
-const OCP_VERSIONS = ['4.16', '4.17', '4.18', '4.19', '4.20', '4.21', '4.22', '5.0'];
+const DEFAULT_OCP_VERSIONS = ['4.16', '4.17', '4.18', '4.19', '4.20', '4.21', '4.22', '5.0'];
 
 const FALLBACK_CATALOGS: CatalogInfo[] = [
   {
@@ -483,6 +483,7 @@ const MirrorConfig: React.FC = () => {
   const [isUploadLoading, setIsUploadLoading] = useState(false);
 
   const [useDigestRef, setUseDigestRef] = useState(false);
+  const [ocpVersions, setOcpVersions] = useState<string[]>(DEFAULT_OCP_VERSIONS);
 
   const catalogDigestMap = useMemo(() => {
     const map: Record<string, string> = {};
@@ -534,8 +535,14 @@ const MirrorConfig: React.FC = () => {
   const fetchAvailableData = useCallback(async () => {
     try {
       setLoading(true);
-      const catalogsRes = await axios.get('/api/catalogs');
+      const [catalogsRes, versionsRes] = await Promise.all([
+        axios.get('/api/catalogs'),
+        axios.get('/api/ocp-versions'),
+      ]);
       setAvailableCatalogs(catalogsRes.data);
+      if (Array.isArray(versionsRes.data) && versionsRes.data.length > 0) {
+        setOcpVersions(versionsRes.data);
+      }
     } catch (error) {
       console.error('Error fetching available data:', error);
       addDangerAlert('Failed to load available channels and operators');
@@ -672,7 +679,7 @@ const MirrorConfig: React.FC = () => {
 
   const addPlatformChannel = () => {
     const newChannel: PlatformChannel = {
-      name: `stable-${OCP_VERSIONS[0]}`,
+      name: `stable-${ocpVersions[0]}`,
       minVersion: '',
       maxVersion: '',
       type: 'ocp',
@@ -1622,7 +1629,7 @@ const MirrorConfig: React.FC = () => {
                       )}
                     >
                       <SelectList>
-                        {OCP_VERSIONS.map(v => (
+                        {ocpVersions.map(v => (
                           <SelectOption key={v} value={`stable-${v}`}>
                             stable-{v}
                           </SelectOption>

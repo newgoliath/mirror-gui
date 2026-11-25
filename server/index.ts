@@ -577,17 +577,56 @@ async function getSystemHealth(): Promise<string> {
 let preFetchedCatalogData: PreFetchedCatalogData | null = null;
 const RUNTIME_CATALOG_DIR = path.join(STORAGE_DIR, 'catalog-data');
 const BUILTIN_CATALOG_DIR = path.join(__dirname, '../catalog-data');
+const CATALOG_CONFIG_PATH = path.join(STORAGE_DIR, 'catalog-config.json');
 
-async function resolveCatalogDataDir(): Promise<string> {
-  const runtimeIndex = path.join(RUNTIME_CATALOG_DIR, 'catalog-index.json');
+interface CatalogConfig {
+  enabledVersions: string[];
+}
+
+async function loadCatalogConfig(): Promise<CatalogConfig | null> {
   try {
-    await fsp.access(runtimeIndex, fs.constants.R_OK);
-    console.log(`Using runtime catalog data from ${RUNTIME_CATALOG_DIR}`);
-    return RUNTIME_CATALOG_DIR;
+    const content = await fsp.readFile(CATALOG_CONFIG_PATH, 'utf8');
+    return JSON.parse(content);
   } catch {
-    console.log(`Using built-in catalog data from ${BUILTIN_CATALOG_DIR}`);
-    return BUILTIN_CATALOG_DIR;
+    return null;
   }
+}
+
+async function saveCatalogConfig(config: CatalogConfig): Promise<void> {
+  await fsp.writeFile(CATALOG_CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+}
+
+interface CatalogIndexEntry {
+  catalog_type: string;
+  ocp_version: string;
+  catalog_url: string;
+  operator_count?: number;
+  digest?: string;
+  synced_at?: string;
+  source?: 'built-in' | 'runtime';
+}
+
+async function loadMergedCatalogIndex(): Promise<{ ocp_versions: string[]; catalog_types: string[]; catalogs: CatalogIndexEntry[] }> {
+  const merged: Map<string, CatalogIndexEntry> = new Map();
+
+  for (const dir of [BUILTIN_CATALOG_DIR, RUNTIME_CATALOG_DIR]) {
+    const indexPath = path.join(dir, 'catalog-index.json');
+    try {
+      await fsp.access(indexPath, fs.constants.R_OK);
+      const index = JSON.parse(await fsp.readFile(indexPath, 'utf8'));
+      const source = dir === BUILTIN_CATALOG_DIR ? 'built-in' : 'runtime';
+      for (const catalog of index.catalogs || []) {
+        const key = `${catalog.catalog_type}:${catalog.ocp_version}`;
+        merged.set(key, { ...catalog, source: source as 'built-in' | 'runtime' });
+      }
+    } catch { /* dir doesn't exist */ }
+  }
+
+  const catalogs = Array.from(merged.values());
+  const versions = [...new Set(catalogs.map(c => c.ocp_version))].sort();
+  const types = [...new Set(catalogs.map(c => c.catalog_type))].sort();
+
+  return { ocp_versions: versions, catalog_types: types, catalogs };
 }
 
 async function loadPreFetchedCatalogData(): Promise<PreFetchedCatalogData | null> {
@@ -596,19 +635,24 @@ async function loadPreFetchedCatalogData(): Promise<PreFetchedCatalogData | null
   }
 
   try {
-    const catalogDir = await resolveCatalogDataDir();
-    const catalogIndexPath = path.join(catalogDir, 'catalog-index.json');
-    const catalogIndex = JSON.parse(await fsp.readFile(catalogIndexPath, 'utf8'));
+    const mergedIndex = await loadMergedCatalogIndex();
+    const config = await loadCatalogConfig();
+    const enabledVersions = config?.enabledVersions ?? null;
+
+    const filteredCatalogs = enabledVersions
+      ? mergedIndex.catalogs.filter(c => enabledVersions.includes(c.ocp_version))
+      : mergedIndex.catalogs;
 
     preFetchedCatalogData = {
-      index: catalogIndex,
+      index: { catalogs: filteredCatalogs },
       operators: {},
       channels: {},
     };
 
     let totalOperators = 0;
 
-    for (const catalog of catalogIndex.catalogs) {
+    for (const catalog of filteredCatalogs) {
+      const catalogDir = catalog.source === 'runtime' ? RUNTIME_CATALOG_DIR : BUILTIN_CATALOG_DIR;
       const operatorsPath = path.join(catalogDir, `${catalog.catalog_type}/${catalog.ocp_version}/operators.json`);
       try {
         const operators: OperatorEntry[] = JSON.parse(await fsp.readFile(operatorsPath, 'utf8'));
@@ -718,12 +762,11 @@ async function loadDependenciesData(): Promise<Record<string, Record<string, Ope
   }
 
   try {
-    const catalogDir = await resolveCatalogDataDir();
-    const catalogIndexPath = path.join(catalogDir, 'catalog-index.json');
-    const catalogIndex = JSON.parse(await fsp.readFile(catalogIndexPath, 'utf8'));
+    const mergedIndex = await loadMergedCatalogIndex();
     const merged: Record<string, Record<string, OperatorDependency[]>> = {};
 
-    for (const catalog of catalogIndex.catalogs) {
+    for (const catalog of mergedIndex.catalogs) {
+      const catalogDir = catalog.source === 'runtime' ? RUNTIME_CATALOG_DIR : BUILTIN_CATALOG_DIR;
       const depsPath = path.join(catalogDir, `${catalog.catalog_type}/${catalog.ocp_version}/dependencies.json`);
       try {
         const deps = JSON.parse(await fsp.readFile(depsPath, 'utf8'));
@@ -1330,15 +1373,70 @@ app.delete('/api/config/delete/:filename', async (req: Request, res: Response) =
   }
 });
 
-app.get('/api/channels', async (req: Request, res: Response) => {
+app.get('/api/channels', async (_req: Request, res: Response) => {
   try {
-    const channels = [
-      'stable-4.16', 'stable-4.17', 'stable-4.18', 'stable-4.19', 'stable-4.20', 'stable-4.21', 'stable-4.22',
-      'stable-5.0',
-    ];
-    res.json(channels);
+    const catalogData = await loadPreFetchedCatalogData();
+    const channelList = catalogData
+      ? [...new Set(catalogData.index.catalogs.map(c => c.ocp_version))]
+          .sort()
+          .map(v => `stable-${v.replace(/^v/, '')}`)
+      : ['stable-4.16', 'stable-4.17', 'stable-4.18', 'stable-4.19', 'stable-4.20', 'stable-4.21', 'stable-4.22', 'stable-5.0'];
+    res.json(channelList);
   } catch {
     res.status(500).json({ error: 'Failed to get channels' });
+  }
+});
+
+app.get('/api/catalog-config', async (_req: Request, res: Response) => {
+  try {
+    const mergedIndex = await loadMergedCatalogIndex();
+    const config = await loadCatalogConfig();
+    const enabledVersions = config?.enabledVersions ?? mergedIndex.ocp_versions;
+
+    const available = mergedIndex.catalogs.map(c => ({
+      catalogType: c.catalog_type,
+      ocpVersion: c.ocp_version,
+      operatorCount: c.operator_count ?? 0,
+      source: c.source ?? 'built-in',
+      syncedAt: c.synced_at ?? null,
+    }));
+
+    res.json({ availableVersions: mergedIndex.ocp_versions, enabledVersions, catalogs: available });
+  } catch (error: unknown) {
+    console.error('Error loading catalog config:', error);
+    res.status(500).json({ error: 'Failed to load catalog configuration' });
+  }
+});
+
+app.get('/api/ocp-versions', async (_req: Request, res: Response) => {
+  try {
+    const catalogData = await loadPreFetchedCatalogData();
+    const versions = catalogData
+      ? [...new Set(catalogData.index.catalogs.map(c => c.ocp_version.replace(/^v/, '')))]
+          .sort()
+      : ['4.16', '4.17', '4.18', '4.19', '4.20', '4.21', '4.22', '5.0'];
+    res.json(versions);
+  } catch {
+    res.status(500).json({ error: 'Failed to get OCP versions' });
+  }
+});
+
+app.put('/api/catalog-config', async (req: Request, res: Response) => {
+  try {
+    const { enabledVersions } = req.body;
+    if (!Array.isArray(enabledVersions) || !enabledVersions.every((v: unknown) => typeof v === 'string')) {
+      res.status(400).json({ error: 'enabledVersions must be an array of strings' });
+      return;
+    }
+
+    await saveCatalogConfig({ enabledVersions });
+    preFetchedCatalogData = null;
+    operatorCache.lastUpdate = 0;
+    console.log(`Catalog config updated: enabled versions = ${enabledVersions.join(', ')}`);
+    res.json({ message: 'Catalog configuration saved', enabledVersions });
+  } catch (error: unknown) {
+    console.error('Error saving catalog config:', error);
+    res.status(500).json({ error: 'Failed to save catalog configuration' });
   }
 });
 

@@ -8,15 +8,14 @@ describe('GET /api/channels', () => {
     request = await getTestApp();
   });
 
-  it('returns array of OCP channels from stable-4.16 to stable-4.21', async () => {
+  it('returns array of OCP channels derived from catalog data', async () => {
     const res = await request.get('/api/channels');
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
-    expect(res.body).toContain('stable-4.16');
-    expect(res.body).toContain('stable-4.17');
-    expect(res.body).toContain('stable-4.18');
-    expect(res.body).toContain('stable-4.19');
-    expect(res.body).toContain('stable-4.20');
+    expect(res.body.length).toBeGreaterThanOrEqual(1);
     expect(res.body).toContain('stable-4.21');
+    for (const channel of res.body) {
+      expect(channel).toMatch(/^stable-\d+\.\d+$/);
+    }
   });
 });
