@@ -2517,7 +2517,7 @@ function computeCatalogDiff(oldData: PreFetchedCatalogData, newData: PreFetchedC
   return diff;
 }
 
-const CATALOG_SYNC_TOTAL = 21; // 7 OCP versions x 3 catalog types
+const CATALOG_TYPES_COUNT = 3; // redhat, certified, community
 
 interface CatalogSyncDiffEntry {
   catalog: string;
@@ -2546,7 +2546,7 @@ let catalogSyncState: CatalogSyncState = {
   syncStartTime: null,
   successCount: 0,
   failedCount: 0,
-  totalCount: CATALOG_SYNC_TOTAL,
+  totalCount: 0,
   completedCatalogs: 0,
   currentCatalog: null,
   error: null,
@@ -2574,6 +2574,16 @@ app.post('/api/catalogs/sync', async (_req: Request, res: Response) => {
     return;
   }
 
+  const config = await loadCatalogConfig();
+  const mergedIndex = await loadMergedCatalogIndex();
+  const enabledVersions = config?.enabledVersions ?? mergedIndex.ocp_versions;
+  const syncVersions = enabledVersions.map(v => v.replace(/^v/, ''));
+
+  if (syncVersions.length === 0) {
+    res.status(400).json({ error: 'No catalog versions are enabled. Enable at least one version in the Catalogs tab before syncing.' });
+    return;
+  }
+
   const previousCatalogData = preFetchedCatalogData;
 
   catalogSyncState = {
@@ -2582,7 +2592,7 @@ app.post('/api/catalogs/sync', async (_req: Request, res: Response) => {
     syncStartTime: new Date().toISOString(),
     successCount: 0,
     failedCount: 0,
-    totalCount: CATALOG_SYNC_TOTAL,
+    totalCount: syncVersions.length * CATALOG_TYPES_COUNT,
     completedCatalogs: 0,
     currentCatalog: null,
     error: null,
@@ -2596,6 +2606,7 @@ app.post('/api/catalogs/sync', async (_req: Request, res: Response) => {
     PULL_SECRET_PATH: pullSecretPath || AUTHFILE_WRITE_PATH,
     SCRIPT_DIR: APP_ROOT_DIR,
     MAX_PARALLEL_JOBS: '3',
+    OCP_VERSIONS_CSV: syncVersions.join(','),
   };
 
   catalogSyncProcess = spawn('bash', [syncScriptPath], {
@@ -2617,7 +2628,7 @@ app.post('/api/catalogs/sync', async (_req: Request, res: Response) => {
         catalogSyncState.currentCatalog = `${extractMatch[1]} ${extractMatch[2]}`;
       }
       if (line.startsWith('Generated metadata for') || line.startsWith('ERROR: Failed to extract') || line.startsWith('ERROR: Failed to generate') || line.startsWith('ERROR: No configs directory')) {
-        catalogSyncState.completedCatalogs = Math.min(catalogSyncState.completedCatalogs + 1, CATALOG_SYNC_TOTAL);
+        catalogSyncState.completedCatalogs = Math.min(catalogSyncState.completedCatalogs + 1, catalogSyncState.totalCount);
       }
     }
   };
