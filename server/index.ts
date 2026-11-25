@@ -1373,6 +1373,87 @@ app.delete('/api/config/delete/:filename', async (req: Request, res: Response) =
   }
 });
 
+app.post('/api/config/merge', async (req: Request, res: Response) => {
+  try {
+    const { base, overlay } = req.body;
+    if (!base || !overlay) {
+      res.status(400).json({ error: 'Both base and overlay config YAML strings are required' });
+      return;
+    }
+
+    const YAML = await import('yaml');
+    const baseConfig = YAML.parse(base);
+    const overlayConfig = YAML.parse(overlay);
+
+    const baseMirror = baseConfig?.mirror || {};
+    const overlayMirror = overlayConfig?.mirror || {};
+
+    const channelMap = new Map<string, any>();
+    for (const ch of baseMirror.platform?.channels || []) {
+      channelMap.set(ch.name, ch);
+    }
+    for (const ch of overlayMirror.platform?.channels || []) {
+      channelMap.set(ch.name, ch);
+    }
+
+    const operatorMap = new Map<string, { catalog: string; packages: Map<string, any> }>();
+    for (const op of baseMirror.operators || []) {
+      const pkgMap = new Map<string, any>();
+      for (const pkg of op.packages || []) {
+        pkgMap.set(pkg.name, pkg);
+      }
+      operatorMap.set(op.catalog, { catalog: op.catalog, packages: pkgMap });
+    }
+    for (const op of overlayMirror.operators || []) {
+      const existing = operatorMap.get(op.catalog);
+      if (existing) {
+        for (const pkg of op.packages || []) {
+          existing.packages.set(pkg.name, pkg);
+        }
+      } else {
+        const pkgMap = new Map<string, any>();
+        for (const pkg of op.packages || []) {
+          pkgMap.set(pkg.name, pkg);
+        }
+        operatorMap.set(op.catalog, { catalog: op.catalog, packages: pkgMap });
+      }
+    }
+
+    const imageSet = new Set<string>();
+    for (const img of baseMirror.additionalImages || []) {
+      imageSet.add(img.name);
+    }
+    for (const img of overlayMirror.additionalImages || []) {
+      imageSet.add(img.name);
+    }
+
+    const merged = {
+      kind: overlayConfig.kind || baseConfig.kind || 'ImageSetConfiguration',
+      apiVersion: overlayConfig.apiVersion || baseConfig.apiVersion || 'mirror.openshift.io/v2alpha1',
+      mirror: {
+        platform: {
+          channels: Array.from(channelMap.values()),
+          graph: baseMirror.platform?.graph ?? overlayMirror.platform?.graph ?? true,
+        },
+        operators: Array.from(operatorMap.values()).map(op => ({
+          catalog: op.catalog,
+          packages: Array.from(op.packages.values()),
+        })),
+        additionalImages: Array.from(imageSet).map(name => ({ name })),
+      },
+    };
+
+    if (baseConfig.archiveSize || overlayConfig.archiveSize) {
+      (merged as any).archiveSize = overlayConfig.archiveSize || baseConfig.archiveSize;
+    }
+
+    res.json({ merged, yaml: YAML.stringify(merged, { indent: 2 }) });
+  } catch (error: unknown) {
+    console.error('Error merging configurations:', error);
+    res.status(500).json({ error: 'Failed to merge configurations' });
+  }
+});
+
 app.get('/api/channels', async (_req: Request, res: Response) => {
   try {
     const catalogData = await loadPreFetchedCatalogData();

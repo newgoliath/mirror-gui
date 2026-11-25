@@ -60,6 +60,7 @@ import {
   ArrowRightIcon,
   PencilAltIcon,
   CheckIcon,
+  CodeBranchIcon,
 } from '@patternfly/react-icons';
 import { FieldBuilder } from '@patternfly/react-component-groups';
 import { TypeaheadSelect, TypeaheadSelectOption } from '@patternfly/react-templates';
@@ -1439,6 +1440,120 @@ const MirrorConfig: React.FC = () => {
     addSuccessAlert('Configuration loaded. Review or edit YAML on the Preview tab.');
   };
 
+  const mergeIntoEditor = () => {
+    if (!parsedUpload) {
+      setFieldError('yaml-upload', 'No valid configuration to merge');
+      return;
+    }
+    clearFieldError('yaml-upload');
+
+    const incomingMirror = parsedUpload.mirror || {};
+
+    const incomingChannels: PlatformChannel[] = (incomingMirror.platform?.channels || []).map(
+      (ch: any) => ({
+        name: ch.name || '',
+        minVersion: ch.minVersion || '',
+        maxVersion: ch.maxVersion || '',
+        type: ch.type || 'ocp',
+        shortestPath: ch.shortestPath || false,
+      }),
+    );
+
+    const incomingOperators: OperatorCatalog[] = (incomingMirror.operators || []).map((op: any) => ({
+      catalog: op.catalog || '',
+      catalogVersion: op.catalog?.split(':').pop() || '',
+      availableOperators: [],
+      packages: (op.packages || []).map((pkg: any) => ({
+        name: pkg.name || '',
+        channels: (pkg.channels || []).map((ch: any) => ({
+          name: ch.name || '',
+          minVersion: ch.minVersion || '',
+        })),
+      })),
+    }));
+
+    const incomingImages: { name: string }[] = (incomingMirror.additionalImages || []).map(
+      (img: any) => ({ name: img.name || '' }),
+    );
+
+    setConfig(prev => {
+      const channelMap = new Map<string, PlatformChannel>();
+      for (const ch of prev.mirror.platform.channels) {
+        channelMap.set(ch.name, ch);
+      }
+      for (const ch of incomingChannels) {
+        if (!channelMap.has(ch.name)) {
+          channelMap.set(ch.name, ch);
+        }
+      }
+
+      const operatorMap = new Map<string, OperatorCatalog>();
+      for (const op of prev.mirror.operators) {
+        operatorMap.set(op.catalog, { ...op });
+      }
+      for (const op of incomingOperators) {
+        const existing = operatorMap.get(op.catalog);
+        if (existing) {
+          const pkgMap = new Map<string, OperatorPackage>();
+          for (const pkg of existing.packages) {
+            pkgMap.set(pkg.name, pkg);
+          }
+          for (const pkg of op.packages) {
+            if (!pkgMap.has(pkg.name)) {
+              pkgMap.set(pkg.name, pkg);
+            }
+          }
+          operatorMap.set(op.catalog, { ...existing, packages: Array.from(pkgMap.values()) });
+        } else {
+          operatorMap.set(op.catalog, op);
+        }
+      }
+
+      const imageSet = new Set(prev.mirror.additionalImages.map(img => img.name));
+      for (const img of incomingImages) {
+        imageSet.add(img.name);
+      }
+
+      return {
+        ...prev,
+        mirror: {
+          ...prev.mirror,
+          platform: {
+            ...prev.mirror.platform,
+            channels: Array.from(channelMap.values()),
+          },
+          operators: Array.from(operatorMap.values()),
+          additionalImages: Array.from(imageSet).map(name => ({ name })),
+        },
+      };
+    });
+
+    setTimeout(async () => {
+      for (const op of incomingOperators) {
+        if (op.catalog) {
+          const ops = await fetchOperatorsForCatalog(op.catalog);
+          setConfig(prev => ({
+            ...prev,
+            mirror: {
+              ...prev.mirror,
+              operators: prev.mirror.operators.map(o =>
+                o.catalog === op.catalog ? { ...o, availableOperators: ops } : o,
+              ),
+            },
+          }));
+          for (const pkg of op.packages) {
+            if (pkg.name) {
+              await fetchOperatorChannels(pkg.name, op.catalog);
+            }
+          }
+        }
+      }
+    }, 0);
+
+    setActiveTab('preview');
+    addSuccessAlert('Configuration merged. New operators and channels have been added to your existing config.');
+  };
+
   const yamlPreview = YAML.stringify(generateCleanConfig(), { indent: 2 });
   const startEditingPreview = () => {
     setEditedYaml(yamlPreview);
@@ -2291,14 +2406,30 @@ const MirrorConfig: React.FC = () => {
                 <Alert variant="danger" isInline title={validationErrors['yaml-upload']} className="pf-v6-u-mt-sm" />
               )}
               <div className="pf-v6-u-mt-md">
-                <Button
-                  variant="primary"
-                  icon={<ArrowRightIcon />}
-                  onClick={() => { clearFieldError('yaml-upload'); loadIntoEditor(); }}
-                  isDisabled={!parsedUpload}
-                >
-                  Load into Editor
-                </Button>
+                <Split hasGutter>
+                  <SplitItem>
+                    <Button
+                      variant="primary"
+                      icon={<ArrowRightIcon />}
+                      onClick={() => { clearFieldError('yaml-upload'); loadIntoEditor(); }}
+                      isDisabled={!parsedUpload}
+                    >
+                      Load into Editor
+                    </Button>
+                  </SplitItem>
+                  <SplitItem>
+                    <Tooltip content="Merge operators, channels, and images from this config into your current editor state without replacing it">
+                      <Button
+                        variant="secondary"
+                        icon={<CodeBranchIcon />}
+                        onClick={() => { clearFieldError('yaml-upload'); mergeIntoEditor(); }}
+                        isDisabled={!parsedUpload}
+                      >
+                        Merge into Editor
+                      </Button>
+                    </Tooltip>
+                  </SplitItem>
+                </Split>
               </div>
             </Tab>
           </Tabs>

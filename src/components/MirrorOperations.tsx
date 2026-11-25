@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, type CSSProperties, type ReactNode } from 'react';
 import axios from 'axios';
+import YAML from 'yaml';
 import {
   Card,
   CardBody,
@@ -361,6 +362,7 @@ const MirrorOperations: React.FC = () => {
   const [registryValidationError, setRegistryValidationError] = useState('');
   const [srcTlsVerify, setSrcTlsVerify] = useState(false);
   const [destTlsVerify, setDestTlsVerify] = useState(false);
+  const [fewerOperatorsWarning, setFewerOperatorsWarning] = useState<string | null>(null);
 
   const operationsRef = useRef<Operation[]>([]);
   const notifiedOperationsRef = useRef(new Set<string>());
@@ -637,6 +639,71 @@ const MirrorOperations: React.FC = () => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [operations]);
+
+  useEffect(() => {
+    if (!selectedConfig || mirrorMode !== 'mirrorToMirror') {
+      setFewerOperatorsWarning(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    const checkOperatorCoverage = async () => {
+      try {
+        const configRes = await axios.get(`/api/config/download/${encodeURIComponent(selectedConfig)}`, {
+          responseType: 'text',
+          transformResponse: [(data: string) => data],
+        });
+        const parsed = YAML.parse(configRes.data);
+        const selectedPackages = new Set<string>();
+        for (const op of parsed?.mirror?.operators || []) {
+          for (const pkg of op.packages || []) {
+            if (pkg.name) selectedPackages.add(pkg.name);
+          }
+        }
+
+        const lastMirrorOp = operations
+          .filter(op => op.status === 'success' && op.configFile !== selectedConfig)
+          .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())[0];
+
+        if (!lastMirrorOp) {
+          if (!cancelled) setFewerOperatorsWarning(null);
+          return;
+        }
+
+        const prevRes = await axios.get(`/api/config/download/${encodeURIComponent(lastMirrorOp.configFile)}`, {
+          responseType: 'text',
+          transformResponse: [(data: string) => data],
+        });
+        const prevParsed = YAML.parse(prevRes.data);
+        const prevPackages = new Set<string>();
+        for (const op of prevParsed?.mirror?.operators || []) {
+          for (const pkg of op.packages || []) {
+            if (pkg.name) prevPackages.add(pkg.name);
+          }
+        }
+
+        const missing = [...prevPackages].filter(p => !selectedPackages.has(p));
+
+        if (!cancelled) {
+          if (missing.length > 0) {
+            setFewerOperatorsWarning(
+              `This config is missing ${missing.length} operator${missing.length > 1 ? 's' : ''} from the last mirrored config (${lastMirrorOp.configFile}): ${missing.join(', ')}. ` +
+              'Mirror-to-mirror replaces the catalog — missing operators will be removed from the target registry. ' +
+              'Use "Merge into Editor" on the Mirror Configuration page to combine configs.',
+            );
+          } else {
+            setFewerOperatorsWarning(null);
+          }
+        }
+      } catch {
+        if (!cancelled) setFewerOperatorsWarning(null);
+      }
+    };
+
+    checkOperatorCoverage();
+    return () => { cancelled = true; };
+  }, [selectedConfig, mirrorMode, operations]);
 
   const getElapsedSeconds = (startedAt: string) => {
     return Math.floor((now - new Date(startedAt).getTime()) / 1000);
@@ -994,6 +1061,17 @@ const MirrorOperations: React.FC = () => {
               )}
             </InputGroup>
           </FormGroup>
+
+          {fewerOperatorsWarning && mirrorMode === 'mirrorToMirror' && (
+            <Alert
+              variant="warning"
+              isInline
+              title="Config has fewer operators than previous mirror"
+              className="pf-v6-u-mt-md"
+            >
+              {fewerOperatorsWarning}
+            </Alert>
+          )}
 
           <FormGroup
             label={
