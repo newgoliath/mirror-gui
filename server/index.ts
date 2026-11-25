@@ -252,22 +252,36 @@ const MIRROR_BASE_DIR = path.resolve(process.env.OC_MIRROR_BASE_MIRROR_DIR || pa
 const DEFAULT_MIRROR_DIR = path.join(MIRROR_BASE_DIR, 'default');
 const CUSTOM_MIRROR_DIR = path.join(MIRROR_BASE_DIR, 'custom');
 const EPHEMERAL_MIRROR_DIR = path.resolve(process.env.OC_MIRROR_EPHEMERAL_DIR || path.join(APP_ROOT_DIR, 'mirror'));
-const AUTHFILE_PATH = process.env.OC_MIRROR_AUTHFILE || '/app/pull-secret.json';
+const PULL_SECRET_SEARCH_PATHS = [
+  '/run/secrets/pull-secret.json',
+  '/run/secrets/pull-secret',
+  '/app/pull-secret.json',
+  path.join(STORAGE_DIR, '.pull-secret.json'),
+];
+
+const AUTHFILE_ENV = process.env.OC_MIRROR_AUTHFILE;
+const AUTHFILE_WRITE_PATH = AUTHFILE_ENV || path.join(STORAGE_DIR, '.pull-secret.json');
 
 let pullSecretPath: string | null = null;
 let pullSecretDetected = false;
 
 async function detectPullSecret(): Promise<void> {
-  try {
-    await fsp.access(AUTHFILE_PATH, fs.constants.R_OK);
-    const content = await fsp.readFile(AUTHFILE_PATH, 'utf8');
-    if (content.trim().length > 2) {
-      pullSecretPath = AUTHFILE_PATH;
-      pullSecretDetected = true;
-      console.log(`Pull secret detected at: ${AUTHFILE_PATH}`);
-      return;
-    }
-  } catch { /* no pull secret file */ }
+  const candidates = AUTHFILE_ENV
+    ? [AUTHFILE_ENV]
+    : PULL_SECRET_SEARCH_PATHS;
+
+  for (const candidate of candidates) {
+    try {
+      await fsp.access(candidate, fs.constants.R_OK);
+      const content = await fsp.readFile(candidate, 'utf8');
+      if (content.trim().length > 2) {
+        pullSecretPath = candidate;
+        pullSecretDetected = true;
+        console.log(`Pull secret detected at: ${candidate}`);
+        return;
+      }
+    } catch { /* try next */ }
+  }
 
   pullSecretPath = null;
   pullSecretDetected = false;
@@ -940,8 +954,16 @@ app.get('/api/system/status', async (req: Request, res: Response) => {
   }
 });
 
-app.get('/api/pull-secret/status', (_req: Request, res: Response) => {
-  res.json({ detected: pullSecretDetected, path: pullSecretPath });
+app.get('/api/pull-secret/status', async (_req: Request, res: Response) => {
+  let readOnly = false;
+  if (pullSecretDetected && pullSecretPath) {
+    try {
+      await fsp.access(pullSecretPath, fs.constants.W_OK);
+    } catch {
+      readOnly = true;
+    }
+  }
+  res.json({ detected: pullSecretDetected, path: pullSecretPath, readOnly });
 });
 
 app.get('/api/pull-secret/content', async (_req: Request, res: Response) => {
@@ -972,10 +994,10 @@ app.post('/api/pull-secret', async (req: Request, res: Response) => {
       return;
     }
 
-    await fsp.writeFile(AUTHFILE_PATH, content, 'utf8');
-    pullSecretPath = AUTHFILE_PATH;
+    await fsp.writeFile(AUTHFILE_WRITE_PATH, content, 'utf8');
+    pullSecretPath = AUTHFILE_WRITE_PATH;
     pullSecretDetected = true;
-    console.log(`Pull secret saved to: ${AUTHFILE_PATH}`);
+    console.log(`Pull secret saved to: ${AUTHFILE_WRITE_PATH}`);
     res.json({ message: 'Pull secret saved successfully' });
   } catch (error: unknown) {
     console.error('Error saving pull secret:', error);
@@ -1732,7 +1754,7 @@ app.post('/api/operations/start', async (req: Request, res: Response) => {
       '--dest-tls-verify=false',
       '--src-tls-verify=false',
       '--cache-dir', cacheDir,
-      '--authfile', AUTHFILE_PATH,
+      '--authfile', pullSecretPath || AUTHFILE_WRITE_PATH,
       ...additionalArgs,
       mirrorUrl,
     ], {
@@ -2301,7 +2323,7 @@ app.post('/api/catalogs/sync', async (_req: Request, res: Response) => {
   const env = {
     ...process.env,
     CATALOG_DATA_DIR: RUNTIME_CATALOG_DIR,
-    PULL_SECRET_PATH: AUTHFILE_PATH,
+    PULL_SECRET_PATH: pullSecretPath || AUTHFILE_WRITE_PATH,
     SCRIPT_DIR: APP_ROOT_DIR,
     MAX_PARALLEL_JOBS: '3',
   };
@@ -2504,7 +2526,7 @@ function logStartup(): void {
   console.log(`Cache directory: ${CACHE_DIR}`);
   console.log(`App root directory: ${APP_ROOT_DIR}`);
   console.log(`Mirror base directory: ${MIRROR_BASE_DIR}`);
-  console.log(`Authfile path: ${AUTHFILE_PATH}`);
+  console.log(`Authfile search paths: ${PULL_SECRET_SEARCH_PATHS.join(', ')}`);
   console.log(`Health check: http://localhost:${PORT}/api/health`);
   console.log(`API endpoints available at: http://localhost:${PORT}/api/*`);
 

@@ -119,7 +119,7 @@ const SettingsPage: React.FC = () => {
   }, [searchParams]);
   const [pullSecretContent, setPullSecretContent] = useState('');
   const [pullSecretFilename, setPullSecretFilename] = useState('');
-  const [pullSecretStatus, setPullSecretStatus] = useState<{ detected: boolean; path: string | null }>({ detected: false, path: null });
+  const [pullSecretStatus, setPullSecretStatus] = useState<{ detected: boolean; path: string | null; readOnly?: boolean }>({ detected: false, path: null });
   const [registries, setRegistries] = useState<RegistryEntry[]>([]);
 
   const [catalogSyncStatus, setCatalogSyncStatus] = useState<CatalogSyncStatus>({
@@ -419,8 +419,10 @@ const SettingsPage: React.FC = () => {
                   className="pf-v6-u-mb-lg"
                 >
                   {pullSecretStatus.detected
-                    ? 'You can view and edit the pull secret content below.'
-                    : 'Upload or paste your pull secret below to enable mirroring operations.'}
+                    ? pullSecretStatus.readOnly
+                      ? `Pull secret is bind-mounted read-only at ${pullSecretStatus.path}. To update it, replace the file on the host and restart the container.`
+                      : 'You can view and edit the pull secret content below.'
+                    : 'Upload or paste your pull secret below to enable mirroring operations. You can also bind-mount pull-secret.json to /run/secrets/pull-secret.json.'}
                 </Alert>
 
                 <FormGroup label="Value" fieldId="pull-secret-upload">
@@ -447,6 +449,8 @@ const SettingsPage: React.FC = () => {
                     }}
                     browseButtonText="Browse..."
                     allowEditingUploadedText
+                    isReadOnly={pullSecretStatus.readOnly}
+                    isDisabled={pullSecretStatus.readOnly}
                   />
                   <HelperText>
                     <HelperTextItem>
@@ -461,7 +465,7 @@ const SettingsPage: React.FC = () => {
                     variant="primary"
                     icon={<SaveIcon />}
                     onClick={savePullSecret}
-                    isDisabled={loading}
+                    isDisabled={loading || pullSecretStatus.readOnly}
                     isLoading={loading}
                   >
                     Save
